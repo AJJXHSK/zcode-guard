@@ -4,8 +4,8 @@ $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
 # ===== 用户配置(换机器/他人使用时只改这三行) =====
-$UserHome    = $env:USERPROFILE         # 用户主目录
-$UserDesktop = "$UserHome\Desktop" # 桌面路径(SYSTEM 任务运行时请硬编码实际用户桌面)
+$UserHome    = 'C:\Users\chen'         # 用户主目录
+$UserDesktop = 'C:\Users\chen\Desktop' # 桌面路径(SYSTEM 任务运行时请硬编码实际用户桌面)
 $ZCodeDir    = 'D:\zcode'               # ZCode 安装目录
 
 
@@ -256,9 +256,9 @@ else { BAD '桌面入口  ZCode.lnk 已被重置为原生 ZCode（更新覆盖�
 $watcher = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -EA SilentlyContinue |
              Where-Object { $_.CommandLine -match 'zcode-guard\.ps1.\s*-Action watch' -and $_.CommandLine -notmatch 'Get-CimInstance' })
 if ($watcher.Count -gt 0) {
-  OK ("守望进程  存活（pid=$($watcher[0].ProcessId)）— 每分钟自动修入口/锁密钥/追更新")
+  OK ("守望进程  存活（pid=$($watcher[0].ProcessId)）— 每分钟自动修入口/锁密钥/补墙/追更新")
 } else {
-  WARN '守望进程  未运行（下次登录自启；当前由 5 分钟兜底任务与手动按 R 补位）'
+  WARN '守望进程  未运行（守卫式启动 ZCode 时会自动拉活，下次登录也会自启）'
   $taskBlocked = $true
 }
 

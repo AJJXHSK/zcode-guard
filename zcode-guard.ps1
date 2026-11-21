@@ -3,7 +3,7 @@
 #   本文件位于 $UserHome\zcode-guard,故意放在 $ZCodeDir(应用目录,会被更新替换)
 #   和 $UserHome\.zcode(数据目录,可能被重置)之外,防更新覆盖。
 param(
-  [ValidateSet('lock', 'unlock', 'status', 'menu', 'launch', 'waitandlock', 'apply', 'install', 'autolock', 'fixshortcut', 'autoscan', 'unwallextra', 'watch')][string]$Action = 'menu',
+  [ValidateSet('lock', 'unlock', 'status', 'menu', 'launch', 'waitandlock', 'apply', 'install', 'autolock', 'fixshortcut', 'autoscan', 'unwallextra', 'watch', 'repairprompt')][string]$Action = 'menu',
   [string]$ConfigPath = "$UserHome\.zcode\v2\config.json",
   # 保持不动的 provider id,用于避免抹掉正在使用中的 provider 密钥
   [string[]]$Exclude = @()
@@ -14,8 +14,8 @@ Add-Type -AssemblyName System.Security
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
 # ===== 用户配置(换机器/他人使用时只改这三行) =====
-$UserHome    = $env:USERPROFILE         # 用户主目录(自动检测)
-$UserDesktop = "$UserHome\Desktop" # 桌面路径(自动跟随当前用户)
+$UserHome    = 'C:\Users\chen'         # 用户主目录
+$UserDesktop = 'C:\Users\chen\Desktop' # 桌面路径(SYSTEM 任务运行时请硬编码实际用户桌面)
 $ZCodeDir    = 'D:\zcode'               # ZCode 安装目录
 
 
@@ -35,6 +35,7 @@ $wallDirs       = @(
 )
 # ---- 自动延伸(随更新发现新落点) ----
 $stateFile       = Join-Path $guardDir 'autoextend-state.json'
+$repairStateFile = Join-Path $guardDir 'repair-state.json'  # 遥测层漂移弹窗的冷却记录
 $asarPath        = "$ZCodeDir\resources\app.asar"
 # 命中这些关键词的目录名才视为敏感(保守,防误伤 ZCode 功能)
 $autoExtKeywords = '^(repo-|.*checkpoint|.*snapshot|.*upload|.*staging|.*pending)'
@@ -562,12 +563,46 @@ function Repair-DefensesSilently {
       Start-Sleep -Seconds 4
       $fixed += '已触发计划任务修复遥测黑洞/防火墙'
     } else {
-      $fixed += '!! 遥测黑洞/防火墙已漂移且计划任务不存在,请运行 install'
+      # 计划任务已被安全软件删除(本机实测)——改用弹窗+UAC 提权重申防护
+      Invoke-ElevatedRepairPrompt
+      $fixed += '遥测黑洞/防火墙已漂移:已弹出修复确认框(确认后经 UAC 提权修复)'
     }
   }
   if ($fixed.Count -gt 0) {
     Write-Host ("防护自愈: " + ($fixed -join '; ')) -ForegroundColor DarkYellow
   }
+}
+
+# 守望进程是否存活:单实例互斥体 Local\ZCodeGuardWatch(由 watch 动作持有)
+function Test-WatchAlive {
+  $created = $false; $m = $null
+  try {
+    $m = New-Object System.Threading.Mutex($false, 'Local\ZCodeGuardWatch', [ref]$created)
+    return (-not $created)
+  } catch { return $false }
+  finally { if ($m) { $m.Dispose() } }
+}
+
+function Test-TelemetryDrift {
+  return ((-not (Test-HostsBlock)) -or (-not (Test-FirewallRule)))
+}
+
+# 遥测层漂移的修复入口(非管理员上下文):拉起独立进程弹确认框 → UAC → apply。
+# 冷却 6 小时:用户拒绝/忽略后不反复打扰;确认框在独立进程里,守望循环不被阻塞。
+function Invoke-ElevatedRepairPrompt {
+  try {
+    $cool = [datetime]::MinValue
+    if (Test-Path $repairStateFile) {
+      $rs = [IO.File]::ReadAllText($repairStateFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
+      $cool = [datetime]::Parse($rs.lastPrompt)
+    }
+    if (((Get-Date) - $cool).TotalHours -lt 6) { Guard-Log 'drift: elevation prompt on cooldown'; return }
+    [IO.File]::WriteAllText($repairStateFile,
+      (@{ lastPrompt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') } | ConvertTo-Json), $utf8NoBom)
+    Guard-Log 'drift: spawning elevation prompt'
+    Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Action', 'repairprompt') | Out-Null
+  } catch { Guard-Log "drift prompt error: $_" }
 }
 
 function Repair-ZCodeShortcut([switch]$Force) {
@@ -657,13 +692,11 @@ function Show-Status {
 
   Write-Host "  开机重申   : " -NoNewline
   if (Test-GuardTask) { Write-Host "计划任务 $taskName 已注册" -ForegroundColor Green }
-  else { Write-Host "未注册（建议运行 install）" -ForegroundColor DarkGray }
+  else { Write-Host "计划任务被安全软件删除（预期内）——登录项+守望进程已接管" -ForegroundColor DarkGray }
 
   Write-Host "  守望进程   : " -NoNewline
-  $wp = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -EA SilentlyContinue |
-          Where-Object { $_.CommandLine -match 'zcode-guard\.ps1.\s*-Action watch' -and $_.CommandLine -notmatch 'Get-CimInstance' })
-  if ($wp.Count -gt 0) { Write-Host "存活（每分钟自动修入口/锁密钥/追更新）" -ForegroundColor Green }
-  else { Write-Host "未运行（下次登录自启）" -ForegroundColor DarkGray }
+  if (Test-WatchAlive) { Write-Host "存活（每分钟自动修入口/锁密钥/补墙/追更新）" -ForegroundColor Green }
+  else { Write-Host "未运行（守卫式启动时会自动拉活）" -ForegroundColor DarkGray }
 
   Write-Host "  桌面入口   : " -NoNewline
   if (Test-ShortcutOk) { Write-Host "ZCode.lnk 指向守卫" -ForegroundColor Green }
@@ -688,6 +721,12 @@ function Start-ZCodeManaged {
   Repair-DefensesSilently
   Backup-Guard
   if (Assert-CheckpointWall) { Write-Host "      快照墙生效" -ForegroundColor DarkGray }
+  # 守望进程可能被安全软件杀掉/登录项没拉起(实测 11-20 重启后未拉起)——每次守卫式启动顺手拉活
+  if (-not (Test-WatchAlive)) {
+    Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Action', 'watch') | Out-Null
+    Guard-Log 'launch: watcher respawned'
+  }
 
   if ((Get-ZCodeProcesses).Count -gt 0) {
     Write-Host ""
@@ -822,17 +861,30 @@ if ($Action -eq 'menu') {
   try { $null = (& schtasks /Delete /F /TN "$taskName-Watcher" 2>&1) } finally { $ErrorActionPreference = $eap }
   if (Test-Path $hiddenVbs) { Remove-Item $hiddenVbs -Force -ErrorAction SilentlyContinue }
 
-  # 清理历史遗留:SYSTEM 计划任务、旧版监视任务与 VBS 启动器
+  # 开机任务以 SYSTEM 身份运行:在 session 0 执行,不产生任何可见窗口,
+  # 因此不需要 wscript/VBS —— 那正是 360 主动防御反复拦截的对象。
+  # apply 只碰 hosts/防火墙/ACL,不触碰 DPAPI,所以 SYSTEM 上下文是安全的。
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   try {
-    $null = (& schtasks /Delete /F /TN $taskName 2>&1)
-    $null = (& schtasks /Delete /F /TN "$taskName-Watcher" 2>&1)
+    $null = (& schtasks /Create /F /TN $taskName /SC ONLOGON /RU SYSTEM /RL HIGHEST `
+      /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Action apply" 2>&1)
   } finally { $ErrorActionPreference = $eap }
-  if (Test-Path $hiddenVbs) { Remove-Item $hiddenVbs -Force -ErrorAction SilentlyContinue }
 
-  Guard-Log "install complete (wall/hosts/firewall/startup watcher; no scheduled task by design)"
-  Write-Host "√ 防护已重申；登录自愈已就位（登录时守望进程自动接管全部巡检）" -ForegroundColor Green
-  Write-Host "  注:不再注册 SYSTEM 计划任务（实测被安全软件静默清除，守望进程已替代）" -ForegroundColor DarkGray
+  # 如实校验:创建成功不等于留得下。安全软件(实测 360)会在数秒内删掉这类任务。
+  Start-Sleep -Seconds 4
+  $taskOk = $null -ne (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
+
+  if ($taskOk) {
+    Guard-Log "install complete; apply task registered as SYSTEM (verified)"
+    Write-Host "√ 防护已重申；开机重申任务已注册为 SYSTEM（完全无窗口）" -ForegroundColor Green
+  } else {
+    Guard-Log "install: task was created but is GONE after 4s (likely removed by security software)"
+    Write-Host "√ 防护已重申；桌面入口已修复" -ForegroundColor Green
+    Write-Host "! 开机重申任务被安全软件删除（预期内，不影响防护）" -ForegroundColor Yellow
+    Write-Host "  登录启动项会拉起常驻守望进程:修入口/锁密钥/补墙/追更新。" -ForegroundColor Yellow
+    Write-Host "  遥测层(hosts/防火墙)漂移时,守望进程会弹窗并经 UAC 自动修复。" -ForegroundColor Yellow
+    Write-Host "  守卫式启动(桌面图标)也会自动把守望进程拉活。" -ForegroundColor DarkGray
+  }
   exit 0
 } elseif ($Action -eq 'watch') {
   # 常驻守望进程(登录自愈启动项拉起,隐藏无窗口):每 60 秒巡检三件事——
@@ -845,23 +897,54 @@ if ($Action -eq 'menu') {
   if (-not $created) { exit 0 }
   try {
     Guard-Log "watch: resident loop started (pid=$PID)"
+    $tick = 0; $driftStreak = 0
     while ($true) {
       try {
+        $tick++
         if (-not (Test-ShortcutOk)) { Repair-ZCodeShortcut | Out-Null }
+        # 墙完整性:目录被删/ACL 被清 → 60 秒内自动重建补墙(目录属主即可加拒绝 ACL,免提权)
+        Assert-CheckpointWall | Out-Null
         Invoke-AutoExtendFast
         if (Test-NeedsScan) {
           Guard-Log "watch: ZCode update detected, auto-rescanning"
           Invoke-AutoExtendScan | Out-Null
         }
+        # 遥测层漂移:连续 2 次命中才认定(防偶发误报),拉起弹窗+UAC 修复(冷却 6h)
+        if (Test-TelemetryDrift) {
+          $driftStreak++
+          if ($driftStreak -ge 2) { Invoke-ElevatedRepairPrompt; $driftStreak = 0 }
+        } else { $driftStreak = 0 }
         Backup-Guard
         if ((Get-ZCodeProcesses).Count -eq 0) {
           $ks = Get-KeyStats
           if ($ks.Plain.Count -gt 0) { Invoke-Lock | Out-Null }
         }
+        if ($tick % 30 -eq 0) { Guard-Log "watch: heartbeat ticks=$tick" }
       } catch { Guard-Log "watch tick error: $_" }
       Start-Sleep -Seconds 60
     }
   } finally { $mutex.ReleaseMutex() }
+} elseif ($Action -eq 'repairprompt') {
+  # 独立进程:遥测层(hosts/防火墙)漂移时由守望进程/自愈路径拉起。
+  # 弹确认框 → UAC 提权 → apply。独立进程是为了不阻塞守望巡检循环。
+  Add-Type -AssemblyName System.Windows.Forms
+  $r = [System.Windows.Forms.MessageBox]::Show(
+    "检测到遥测黑洞/防火墙防护层被改动（hosts 条目或防火墙规则丢失）。`n`n点「确定」后将弹出 UAC 授权，自动修复。",
+    'ZCode Guard — 防护层修复',
+    [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+    [System.Windows.Forms.MessageBoxIcon]::Warning,
+    [System.Windows.Forms.MessageBoxDefaultButton]::Button1,
+    [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly)
+  if ($r -eq [System.Windows.Forms.DialogResult]::OK) {
+    Guard-Log 'repairprompt: confirmed, elevating'
+    try {
+      Start-Process powershell -Verb RunAs -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+        '-File', "`"$PSCommandPath`"", '-Action', 'apply')
+      Guard-Log 'repairprompt: elevated apply launched'
+    } catch { Guard-Log "repairprompt: elevation declined/failed: $_" }
+  } else { Guard-Log 'repairprompt: dismissed by user' }
+  exit 0
 } elseif ($Action -eq 'autoscan') {
   # 手动触发第二层全量扫描(更新检测也会自动触发,此入口用于排查)
   $r = Invoke-AutoExtendScan
